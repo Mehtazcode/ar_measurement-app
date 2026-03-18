@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import 'pose_painter.dart';
+import 'package:flutter/foundation.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -58,7 +61,8 @@ class HomePage extends StatelessWidget {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => CameraPage(camera: cameras.first),
+                    builder: (context) =>
+                        CameraPage(camera: cameras.first),
                   ),
                 );
               },
@@ -92,6 +96,14 @@ class CameraPage extends StatefulWidget {
 class _CameraPageState extends State<CameraPage> {
   late CameraController _controller;
   late Future<void> _initializeControllerFuture;
+  final PoseDetector _poseDetector = PoseDetector(
+    options: PoseDetectorOptions(mode: PoseDetectionMode.stream),
+  );
+
+  List<Pose> _poses = [];
+  bool _isDetecting = false;
+  Size _imageSize = Size.zero;
+  String _measurement = '';
 
   @override
   void initState() {
@@ -99,21 +111,105 @@ class _CameraPageState extends State<CameraPage> {
     _controller = CameraController(
       widget.camera,
       ResolutionPreset.high,
+      enableAudio: false,
     );
-    _initializeControllerFuture = _controller.initialize();
+    _initializeControllerFuture = _controller.initialize().then((_) {
+      _controller.startImageStream(_processCameraImage);
+    });
   }
 
   @override
   void dispose() {
+    _controller.stopImageStream();
     _controller.dispose();
+    _poseDetector.close();
     super.dispose();
+  }
+
+  Future<void> _processCameraImage(CameraImage image) async {
+    if (_isDetecting) return;
+    _isDetecting = true;
+
+    try {
+      final inputImage = _convertCameraImage(image);
+      if (inputImage == null) {
+        _isDetecting = false;
+        return;
+      }
+
+      final poses = await _poseDetector.processImage(inputImage);
+
+      if (mounted) {
+        setState(() {
+          _poses = poses;
+          _imageSize = Size(
+            image.width.toDouble(),
+            image.height.toDouble(),
+          );
+          if (poses.isNotEmpty) {
+            _measurement = _calculateHeight(poses.first);
+          } else {
+            _measurement = '';
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('Error detecting pose: $e');
+    }
+
+    _isDetecting = false;
+  }
+
+  InputImage? _convertCameraImage(CameraImage image) {
+  final camera = widget.camera;
+  final rotation = InputImageRotationValue.fromRawValue(
+    camera.sensorOrientation,
+  );
+  if (rotation == null) return null;
+
+  // Concatenate all planes into one byte array
+  final WriteBuffer allBytes = WriteBuffer();
+  for (final plane in image.planes) {
+    allBytes.putUint8List(plane.bytes);
+  }
+  final bytes = allBytes.done().buffer.asUint8List();
+
+  return InputImage.fromBytes(
+    bytes: bytes,
+    metadata: InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: InputImageFormat.nv21,
+      bytesPerRow: image.planes.first.bytesPerRow,
+    ),
+  );
+}
+
+  String _calculateHeight(Pose pose) {
+    final nose = pose.landmarks[PoseLandmarkType.nose];
+    final leftAnkle = pose.landmarks[PoseLandmarkType.leftAnkle];
+    final rightAnkle = pose.landmarks[PoseLandmarkType.rightAnkle];
+
+    if (nose == null || (leftAnkle == null && rightAnkle == null)) return '';
+
+    final ankle = leftAnkle ?? rightAnkle!;
+
+    // Pixel height difference
+    final pixelHeight = (ankle.y - nose.y).abs();
+
+    // Rough estimate: average person is ~170cm
+    // We use a scale factor based on typical pose proportions
+    final estimatedCm = (pixelHeight / _imageSize.height * 170 * 1.15)
+        .toStringAsFixed(1);
+
+    return '$estimatedCm cm';
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Camera'),
+        title: const Text('Measure'),
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
       ),
@@ -122,18 +218,33 @@ class _CameraPageState extends State<CameraPage> {
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.done) {
             return Stack(
+              fit: StackFit.expand,
               children: [
                 CameraPreview(_controller),
-                const Align(
-                  alignment: Alignment.bottomCenter,
-                  child: Padding(
-                    padding: EdgeInsets.all(24.0),
+                if (_poses.isNotEmpty && _imageSize != Size.zero)
+                  CustomPaint(
+                    painter: PosePainter(_poses, _imageSize),
+                  ),
+                Align(
+                  alignment: Alignment.topCenter,
+                  child: Container(
+                    margin: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                     child: Text(
-                      'Point camera at a person to measure',
-                      style: TextStyle(
+                      _measurement.isEmpty
+                          ? 'Point camera at a person'
+                          : 'Height: $_measurement',
+                      style: const TextStyle(
                         color: Colors.white,
-                        fontSize: 16,
-                        backgroundColor: Colors.black54,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
                   ),

@@ -61,8 +61,7 @@ class HomePage extends StatelessWidget {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (context) =>
-                        CameraPage(camera: cameras.first),
+                    builder: (context) => CameraPage(camera: cameras.first),
                   ),
                 );
               },
@@ -142,10 +141,15 @@ class _CameraPageState extends State<CameraPage> {
       if (mounted) {
         setState(() {
           _poses = poses;
-          _imageSize = Size(
-            image.width.toDouble(),
-            image.height.toDouble(),
-          );
+          if (poses.isNotEmpty) {
+            final nose = poses.first.landmarks[PoseLandmarkType.nose];
+            final leftAnkle = poses.first.landmarks[PoseLandmarkType.leftAnkle];
+            debugPrint('Image size: ${image.width} x ${image.height}');
+            debugPrint('Sensor orientation: ${widget.camera.sensorOrientation}');
+            debugPrint('Nose: x=${nose?.x}, y=${nose?.y}');
+            debugPrint('Ankle: x=${leftAnkle?.x}, y=${leftAnkle?.y}');
+          }
+          _imageSize = Size(image.width.toDouble(), image.height.toDouble());
           if (poses.isNotEmpty) {
             _measurement = _calculateHeight(poses.first);
           } else {
@@ -161,49 +165,53 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   InputImage? _convertCameraImage(CameraImage image) {
-  final camera = widget.camera;
-  final rotation = InputImageRotationValue.fromRawValue(
-    camera.sensorOrientation,
-  );
-  if (rotation == null) return null;
+    final camera = widget.camera;
+    final rotation = InputImageRotationValue.fromRawValue(
+      camera.sensorOrientation,
+    );
+    if (rotation == null) return null;
 
-  // Concatenate all planes into one byte array
-  final WriteBuffer allBytes = WriteBuffer();
-  for (final plane in image.planes) {
-    allBytes.putUint8List(plane.bytes);
+    // Concatenate all planes into one byte array
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: InputImageFormat.nv21,
+        bytesPerRow: image.planes.first.bytesPerRow,
+      ),
+    );
   }
-  final bytes = allBytes.done().buffer.asUint8List();
-
-  return InputImage.fromBytes(
-    bytes: bytes,
-    metadata: InputImageMetadata(
-      size: Size(image.width.toDouble(), image.height.toDouble()),
-      rotation: rotation,
-      format: InputImageFormat.nv21,
-      bytesPerRow: image.planes.first.bytesPerRow,
-    ),
-  );
-}
 
   String _calculateHeight(Pose pose) {
     final nose = pose.landmarks[PoseLandmarkType.nose];
     final leftAnkle = pose.landmarks[PoseLandmarkType.leftAnkle];
     final rightAnkle = pose.landmarks[PoseLandmarkType.rightAnkle];
 
-    if (nose == null || (leftAnkle == null && rightAnkle == null)) return '';
+    if (nose == null) return '';
+    if (leftAnkle == null && rightAnkle == null) return '';
 
-    final ankle = leftAnkle ?? rightAnkle!;
+    double ankleY;
+    if (leftAnkle != null && rightAnkle != null) {
+      ankleY = (leftAnkle.y + rightAnkle.y) / 2;
+    } else {
+      ankleY = (leftAnkle ?? rightAnkle!).y;
+    }
 
-    // Pixel height difference
-    final pixelHeight = (ankle.y - nose.y).abs();
+    // y is now correctly the vertical axis (0-1280)
+    final pixelHeight = (ankleY - nose.y).abs();
+    final percentage = pixelHeight / _imageSize.width; // 1280 = portrait height
+    final estimatedCm = (percentage * 175 / 0.93).toStringAsFixed(1);
 
-    // Rough estimate: average person is ~170cm
-    // We use a scale factor based on typical pose proportions
-    final estimatedCm = (pixelHeight / _imageSize.height * 170 * 1.15)
-        .toStringAsFixed(1);
-
-    return '$estimatedCm cm';
+    return estimatedCm;
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -223,7 +231,11 @@ class _CameraPageState extends State<CameraPage> {
                 CameraPreview(_controller),
                 if (_poses.isNotEmpty && _imageSize != Size.zero)
                   CustomPaint(
-                    painter: PosePainter(_poses, _imageSize),
+                    painter: PosePainter(
+                      _poses,
+                      _imageSize,
+                      widget.camera.sensorOrientation,
+                    ),
                   ),
                 Align(
                   alignment: Alignment.topCenter,
@@ -240,7 +252,7 @@ class _CameraPageState extends State<CameraPage> {
                     child: Text(
                       _measurement.isEmpty
                           ? 'Point camera at a person'
-                          : 'Height: $_measurement',
+                          : 'Height: $_measurement cm',
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 22,
